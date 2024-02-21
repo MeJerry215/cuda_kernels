@@ -7,7 +7,7 @@ enum Major {
 };
 
 #define ELEME_OF(p, x, y, s) (p[(x) * (s) + (y)])
-#define matmul_nn matmul_v0_nn
+#define matmul_nn matmul_v1_nn
 using KernelFunction = void (*)(float*, float*, float*, int, int, int, dim3, dim3, Major);
 
 // https://github.com/tpoisonooo/how-to-optimize-gemm/blob/master/cuda/MMult_cuda_3.cu
@@ -30,12 +30,29 @@ __global__ void matmul_v0_nn(T* __restrict__  A, T* __restrict__  B, T* __restri
 
 
 // basic optimization method: blocking load
+// BLOCK_M = BLOCK_N = BLOCK_K
 template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_SIZE_M, int THREAD_SIZE_N, const bool ENABLE_DOUBLE_BUFFER = false>
 __global__ void matmul_v1_nn(T* A, T* B, T* C, int M, int N, int K)
 {
     int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
     T* AG = A + bx * BLOCK_M * K;
-    T* BG = B + by * BLOCK_N * N;
+    T* BG = B + by * BLOCK_N;
+    float sum = zero<T>();
+
+    for(T* a_ptr = AG, *b_ptr = BG; a_ptr < AG + K; a_ptr += BLOCK_K, b_ptr += BLOCK_K * N) {
+        __shared__ T AS[BLOCK_M][BLOCK_K];
+        __shared__ T BS[BLOCK_K][BLOCK_N];
+        AS[ty][tx] = a_ptr[ty * K + tx];
+        BS[ty][tx] = b_ptr[ty * N + tx];
+        __syncthreads();
+#pragma unroll
+
+        for (int k = 0; k < BLOCK_K; k++)
+            sum += AS[ty][k] * BS[k][tx];
+    }
+
+    int x = bx * BLOCK_M + ty, y = by * BLOCK_N + tx;
+    ELEME_OF(C, x, y, N) = sum;
 }
 
 template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_SIZE_M, int THREAD_SIZE_N>
@@ -118,25 +135,30 @@ void register_kernels()
 {
     // v0 case
     // 1024 case
-    REGISTER_FLOAT_KERNEL(1, 1024, 0, 0, 0);
-    REGISTER_FLOAT_KERNEL(2, 512, 0, 0, 0);
-    // 512 case
-    REGISTER_FLOAT_KERNEL(1, 512, 0, 0, 0);
-    REGISTER_FLOAT_KERNEL(2, 256, 0, 0, 0);
-    // 256 case
-    REGISTER_FLOAT_KERNEL(1, 256, 0, 0, 0);
-    REGISTER_FLOAT_KERNEL(2, 128, 0, 0, 0);
-    // 128 case
-    REGISTER_FLOAT_KERNEL(1, 128, 0, 0, 0);
-    REGISTER_FLOAT_KERNEL(2, 64, 0, 0, 0);
-    // 64
-    REGISTER_FLOAT_KERNEL(1, 64, 0, 0, 0);
-    REGISTER_FLOAT_KERNEL(2, 32, 0, 0, 0);
-    // 32
-    REGISTER_FLOAT_KERNEL(1, 32, 0, 0, 0);
-    REGISTER_FLOAT_KERNEL(2, 16, 0, 0, 0);
+    // REGISTER_FLOAT_KERNEL(1, 1024, 0, 0, 0);
+    // REGISTER_FLOAT_KERNEL(2, 512, 0, 0, 0);
+    // // 512 case
+    // REGISTER_FLOAT_KERNEL(1, 512, 0, 0, 0);
+    // REGISTER_FLOAT_KERNEL(2, 256, 0, 0, 0);
+    // // 256 case
+    // REGISTER_FLOAT_KERNEL(1, 256, 0, 0, 0);
+    // REGISTER_FLOAT_KERNEL(2, 128, 0, 0, 0);
+    // // 128 case
+    // REGISTER_FLOAT_KERNEL(1, 128, 0, 0, 0);
+    // REGISTER_FLOAT_KERNEL(2, 64, 0, 0, 0);
+    // // 64
+    // REGISTER_FLOAT_KERNEL(1, 64, 0, 0, 0);
+    // REGISTER_FLOAT_KERNEL(2, 32, 0, 0, 0);
+    // // 32
+    // REGISTER_FLOAT_KERNEL(1, 32, 0, 0, 0);
+    // REGISTER_FLOAT_KERNEL(2, 16, 0, 0, 0);
+    // v1 case
+    REGISTER_FLOAT_KERNEL(8, 8, 8, 0, 0);
+    REGISTER_FLOAT_KERNEL(16, 16, 16, 0, 0);
+    REGISTER_FLOAT_KERNEL(32, 32, 32, 0, 0);
 }
 
+#define generate_testcase generate_testcase_v1
 
 void generate_testcase_v0(vector<pair<vector<int>, vector<int>>>& testcases, int M, int N, int K, int T)
 {
@@ -147,7 +169,12 @@ void generate_testcase_v0(vector<pair<vector<int>, vector<int>>>& testcases, int
     }
 }
 
-#define generate_testcase generate_testcase_v0
+void generate_testcase_v1(vector<pair<vector<int>, vector<int>>>& testcases, int M, int N, int K, int T)
+{
+    testcases.push_back(make_pair<vector<int>, vector<int>>({8, 8, 8, 0, 0}, {M, N, K}));
+    testcases.push_back(make_pair<vector<int>, vector<int>>({16, 16, 16, 0, 0}, {M, N, K}));
+    testcases.push_back(make_pair<vector<int>, vector<int>>({32, 32, 32, 0, 0}, {M, N, K}));
+}
 
 int main(int argc, char** argv)
 {
@@ -155,12 +182,7 @@ int main(int argc, char** argv)
     const int MAX_M = 1024, MAX_N = 1024, MAX_K = 1024;
     vector<pair<vector<int>, vector<int>>> testcases = {
     };
-    generate_testcase(testcases, 1024, 1024, 1024, 1024);
-    generate_testcase(testcases, 1024, 1024, 1024, 512);
-    generate_testcase(testcases, 1024, 1024, 1024, 256);
-    generate_testcase(testcases, 1024, 1024, 1024, 128);
-    generate_testcase(testcases, 1024, 1024, 1024, 64);
-    generate_testcase(testcases, 1024, 1024, 1024, 32);
+    generate_testcase(testcases, 1024, 1024, 1024, 0);
     REGISTER_BUFF(A, bytes_of<float>(MAX_M * MAX_K));
     REGISTER_BUFF(B, bytes_of<float>(MAX_N * MAX_K));
     REGISTER_BUFF(C, bytes_of<float>(MAX_M * MAX_N));
