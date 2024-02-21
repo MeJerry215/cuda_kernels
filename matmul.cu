@@ -7,13 +7,13 @@ enum Major {
 };
 
 #define ELEME_OF(p, x, y, s) (p[(x) * (s) + (y)])
-#define sgemm_nn sgemm_v0_nn
+#define matmul_nn matmul_v0_nn
 using KernelFunction = void (*)(float*, float*, float*, int, int, int, dim3, dim3, Major);
 
 // https://github.com/tpoisonooo/how-to-optimize-gemm/blob/master/cuda/MMult_cuda_3.cu
 // M, K @ K, N -> M, N  raw implementation
 template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_SIZE_M, int THREAD_SIZE_N, const bool ENABLE_DOUBLE_BUFFER = false>
-__global__ void sgemm_v0_nn(T* __restrict__  A, T* __restrict__  B, T* __restrict__  C, int M, int N, int K)
+__global__ void matmul_v0_nn(T* __restrict__  A, T* __restrict__  B, T* __restrict__  C, int M, int N, int K)
 {
     int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
     int x = bx * BLOCK_M + tx, y = by * BLOCK_N + ty;
@@ -29,20 +29,20 @@ __global__ void sgemm_v0_nn(T* __restrict__  A, T* __restrict__  B, T* __restric
 }
 
 
-
-
 // basic optimization method: blocking load
 template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_SIZE_M, int THREAD_SIZE_N, const bool ENABLE_DOUBLE_BUFFER = false>
-__global__ void sgemm_v1_nn(T* A, T* B, T* C, int M, int N, int K)
+__global__ void matmul_v1_nn(T* A, T* B, T* C, int M, int N, int K)
 {
     int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
+    T* AG = A + bx * BLOCK_M * K;
+    T* BG = B + by * BLOCK_N * N;
 }
 
 template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_SIZE_M, int THREAD_SIZE_N>
-void sgemm_wrapper(T* A, T* B, T* C, int M, int N, int K, dim3 grid, dim3 block, Major major)
+void matmul_wrapper(T* A, T* B, T* C, int M, int N, int K, dim3 grid, dim3 block, Major major)
 {
     if (major == RowMajor)
-        sgemm_nn<T, BLOCK_M, BLOCK_N, BLOCK_K, THREAD_SIZE_M, THREAD_SIZE_N> <<< grid, block>>>(A, B, C, M, N, K);
+        matmul_nn<T, BLOCK_M, BLOCK_N, BLOCK_K, THREAD_SIZE_M, THREAD_SIZE_N> <<< grid, block>>>(A, B, C, M, N, K);
     else if (major == ColMajor)
         assert(false);
 }
@@ -110,7 +110,7 @@ KernelFunction query_kernel(vector<int> config)
 }
 
 #define REGISTER_KERNEL(dtype, BM, BN, BK, WM, WN) \
-    register_kernel({BM, BN, BK, WM, WN}, sgemm_wrapper<dtype, BM, BN, BK, WM, WN>);
+    register_kernel({BM, BN, BK, WM, WN}, matmul_wrapper<dtype, BM, BN, BK, WM, WN>);
 
 #define REGISTER_FLOAT_KERNEL(BM, BN, BK, WM, WN) REGISTER_KERNEL(float, BM, BN, BK, WM, WN)
 
