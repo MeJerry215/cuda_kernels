@@ -10,15 +10,17 @@ enum Major {
 #define sgemm_nn sgemm_v0_nn
 using KernelFunction = void (*)(float*, float*, float*, int, int, int, dim3, dim3, Major);
 
-// M, K    K, N  raw implementation
+// https://github.com/tpoisonooo/how-to-optimize-gemm/blob/master/cuda/MMult_cuda_3.cu
+// M, K @ K, N -> M, N  raw implementation
 template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_SIZE_M, int THREAD_SIZE_N, const bool ENABLE_DOUBLE_BUFFER = false>
 __global__ void sgemm_v0_nn(T* __restrict__  A, T* __restrict__  B, T* __restrict__  C, int M, int N, int K)
 {
     int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
     int x = bx * BLOCK_M + tx, y = by * BLOCK_N + ty;
-    T sum = zero<T>();
 
     if (x >= M || y >= N) return;
+
+    T sum = zero<T>();
 
     for(int i = 0; i < K; i++)
         sum = fmaf(ELEME_OF(A, x, i, K), ELEME_OF(B, i, y, N), sum);
@@ -26,29 +28,14 @@ __global__ void sgemm_v0_nn(T* __restrict__  A, T* __restrict__  B, T* __restric
     ELEME_OF(C, x, y, N) = sum;
 }
 
+
+
+
 // basic optimization method: blocking load
 template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_SIZE_M, int THREAD_SIZE_N, const bool ENABLE_DOUBLE_BUFFER = false>
 __global__ void sgemm_v1_nn(T* A, T* B, T* C, int M, int N, int K)
 {
-    int bx = blockIdx.x, by = blockIdx.y;
-    int tx = threadIdx.x, ty = threadIdx.y;
-    __shared__ T AS[BLOCK_M][BLOCK_K];
-    __shared__ T BS[BLOCK_K][BLOCK_N];
-    int MIter = (M + BLOCK_M - 1) / BLOCK_M;
-    int KIter = (K + BLOCK_K - 1) / BLOCK_K;
-    int NIter = (N + BLOCK_N - 1) / BLOCK_N;
-    const int THREADS_M_PER_BLOCK = BLOCK_M / THREAD_SIZE_M;
-    const int THREADS_N_PER_BLOCK = BLOCK_N / THREAD_SIZE_N;
-    const int THREAD_NUM_PER_BLOCK = THREADS_M_PER_BLOCK * THREADS_N_PER_BLOCK;
-
-    for(int k = 0; k < KIter; k++) {
-        // load from global to share
-        
-        // compute block gemm
-    }
-
-    // write back to global
-
+    int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
 }
 
 template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_SIZE_M, int THREAD_SIZE_N>
