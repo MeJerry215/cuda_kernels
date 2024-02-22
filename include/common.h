@@ -17,6 +17,7 @@
 #include <cmath>
 #include <string>
 #include <fstream>
+#include <sys/stat.h>
 
 using std::vector;
 using std::cout;
@@ -51,6 +52,11 @@ const int WARP_SIZE = 32;
 const int max_block_threads = 1024;
 const int A10_SM_CNT = 72;
 const int A10_SP_CNT = 128;
+
+enum Major {
+    RowMajor = 0,
+    ColMajor = 0,
+};
 
 #define OF_DEVICE_FUNCTION __device__ __host__ __forceinline__
 #define DEVICE_FUNCTION __device__ __forceinline__
@@ -117,6 +123,8 @@ const int A10_SP_CNT = 128;
 #define MEMSET_BUF(name, bytes)                         \
     memset(h_##name, 0, bytes);                         \
     CHECK_CALL_ERROR(cudaMemset(d_##name, 0, bytes));
+
+#define ELEME_OF(p, x, y, s) (p[(x) * (s) + (y)])
 
 template<typename T>
 size_t bytes_of()
@@ -344,6 +352,13 @@ size_t count_large_diff(const float* a, const float* b, size_t n, float atol, fl
     return count;
 }
 
+bool fileExists(const string& filename)
+{
+    ifstream file(filename.c_str());
+    return file.good();
+}
+
+
 void dump_to_file(const char* filename, const void* data, size_t size)
 {
     // 打开二进制写文件
@@ -402,6 +417,16 @@ void* load_from_file(const char* filename, size_t& dataSize, void* outputPtr = n
     return outputPtr;
 }
 
+template<typename T>
+void genOrLoad(const string &filename, void *ptr, size_t n_elems) {
+    if (fileExists(filename)) {
+        size_t dataSize = 0;
+        load_from_file(filename.c_str(), dataSize, ptr);
+    } else {
+        gen_random<T>((T*)ptr, n_elems);
+    }
+}
+
 template <typename T>
 DEVICE_FUNCTION T zero();
 
@@ -446,6 +471,8 @@ DEVICE_FUNCTION int8_t zero<int8_t>()
 {
     return 0;
 }
+
+
 
 namespace std
 {
