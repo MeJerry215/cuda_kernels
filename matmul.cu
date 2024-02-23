@@ -423,11 +423,11 @@ __global__ void matmul_v4_nn(T* A, T* B, T* C, int M, int N, int K)
         from_a += BLOCK_K;
         from_b += BLOCK_K * N;
         // part2: calculation
-        // 计算 2x2 个 4x4
+        // 计算 2x2 个 4x4  8x128 AS 8x128 BS compute
         int aidx0 = (tx / 16) * 4;
         int bidx0 = (tx % 16) * 4;
 
-        for (int subk = 0; subk < 8; ++subk) {
+        for (int subk = 0; subk < BLOCK_K; ++subk) {
             float* ptrA = ashare + aidx0 + subk * BLOCK_M;
 
             for (int i = 0; i < 4; ++i) {
