@@ -1,6 +1,6 @@
 #include "common.h"
 
-#define V2
+#define V3
 
 #ifdef V0
     #define matmul_nn matmul_v0_nn
@@ -15,7 +15,9 @@
     #define generate_testcase generate_testcase_v2
     #define CASE1
 #elif defined(V3)
-
+    #define matmul_nn matmul_v3_nn
+    #define generate_testcase generate_testcase_v3
+    #define CASE1
 #elif defined(V4)
 
 #endif
@@ -29,7 +31,7 @@
 using KernelFunction = void (*)(float*, float*, float*, int, int, int, dim3, dim3, Major);
 unordered_map<vector<int>, KernelFunction> kernel_map;
 
-template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int WARP_M, int WARP_N>
+template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N>
 void matmul_wrapper(T* A, T* B, T* C, int M, int N, int K, dim3 grid, dim3 block, Major major);
 
 void register_kernel(vector<int> config, KernelFunction func)
@@ -78,6 +80,13 @@ void generate_testcase_v2(vector<pair<vector<int>, vector<int>>>& testcases, int
     testcases.push_back(make_pair<vector<int>, vector<int>>({64, 64, 64, 8, 8}, {M, N, K}));
 }
 
+void generate_testcase_v3(vector<pair<vector<int>, vector<int>>>& testcases, int M, int N, int K)
+{
+    testcases.push_back(make_pair<vector<int>, vector<int>>({16, 16, 16, 2, 2}, {M, N, K}));
+    testcases.push_back(make_pair<vector<int>, vector<int>>({32, 32, 32, 2, 2}, {M, N, K}));
+    testcases.push_back(make_pair<vector<int>, vector<int>>({32, 32, 32, 4, 4}, {M, N, K}));
+}
+
 void register_kernels()
 {
 #ifdef V0
@@ -110,10 +119,10 @@ void register_kernels()
     REGISTER_FLOAT_KERNEL(64, 64, 64, 2, 2);
     REGISTER_FLOAT_KERNEL(64, 64, 64, 4, 4);
     REGISTER_FLOAT_KERNEL(64, 64, 64, 8, 8);
-    // REGISTER_FLOAT_KERNEL(128, 128, 128, 2, 2);
-    // REGISTER_FLOAT_KERNEL(128, 128, 128, 4, 4);
-    // REGISTER_FLOAT_KERNEL(128, 128, 128, 8, 8);
-    // REGISTER_FLOAT_KERNEL(128, 128, 128, 16, 16);
+#elif defined(V3)
+    REGISTER_FLOAT_KERNEL(16, 16, 16, 2, 2);
+    REGISTER_FLOAT_KERNEL(32, 32, 32, 2, 2);
+    REGISTER_FLOAT_KERNEL(32, 32, 32, 4, 4);
 #endif
 }
 
@@ -184,7 +193,7 @@ best of 2.13 ms     (512, 16), (2, 64)  (512, 8), (2, 128)  (512, 32), (2, 32)
 2048 x 2048 x 2048
 best of 16.97 ms    (1024, 16), (2, 128)  (1024, 64), (2, 32)
 */
-template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int WARP_M, int WARP_N, const bool ENABLE_DOUBLE_BUFFER = false>
+template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N, const bool ENABLE_DOUBLE_BUFFER = false>
 __global__ void matmul_v0_nn(T* __restrict__  A, T* __restrict__  B, T* __restrict__  C, int M, int N, int K)
 {
     int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
@@ -213,7 +222,7 @@ best of 1.66 ms     (64, 64), (16, 16)
 2048 x 2048 x 2048
 best of 12.99 ms    (128, 128), (16, 16)
 */
-template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int WARP_M, int WARP_N, const bool ENABLE_DOUBLE_BUFFER = false>
+template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N, const bool ENABLE_DOUBLE_BUFFER = false>
 __global__ void matmul_v1_nn(T* A, T* B, T* C, int M, int N, int K)
 {
     int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
@@ -241,69 +250,140 @@ __global__ void matmul_v1_nn(T* A, T* B, T* C, int M, int N, int K)
     ELEME_OF(C, x, y, N) = sum;
 }
 
-// #define SHARP_K 16
-// basic optimization: block optimize commute and store
-// BLOCK_M = BLOCK_N = BLOCK_K WARP_M = WARP_N
+// basic optimization: block optimize commute and store + share memory align  内存对齐在这一步加速了10%左右
+// BLOCK_M = BLOCK_N = BLOCK_K THREAD_M = THREAD_N
 /*
 256 x 256 x 256
-best of 18.98 us    (8, 8), (16, 16)
+best of 18.50 us    (8, 8), (16, 16)     (2, 2)
 768 x 768 x 768
-best of 173.25 us   (12, 12), (16, 16)
+best of 151.01 us   (12, 12), (16, 16)   (4, 4)
 1024 x 1024 x 1024
-best of 0.43 ms     (16, 16), (16, 16)
+best of 0.37 ms     (16, 16), (16, 16)   (4, 4)
 2048 x 2048 x 2048
-best of 3.08 ms    (32, 32), (16, 16)
+best of 3.08 ms    (32, 32), (16, 16)    (4, 4)
 */
-template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int WARP_M, int WARP_N, const bool ENABLE_DOUBLE_BUFFER = false>
+template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N, const bool ENABLE_DOUBLE_BUFFER = false>
 __global__ void matmul_v2_nn(T* A, T* B, T* C, int M, int N, int K)
 {
     int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
     T* AG = A + bx * BLOCK_M * K;
     T* BG = B + by * BLOCK_N;
     T* CG = C + bx * BLOCK_M * N + by * BLOCK_N;
-    T sum[WARP_M][WARP_N] = {zero<T>()};
-    __shared__ T AS[BLOCK_M][BLOCK_K];
-    __shared__ T BS[BLOCK_K][BLOCK_N];
+    T sum[THREAD_M][THREAD_N] = {zero<T>()};
+    __shared__  __align__(BLOCK_M * BLOCK_K * sizeof(T)) T AS[BLOCK_M][BLOCK_K];
+    __shared__  __align__(BLOCK_M * BLOCK_K * sizeof(T)) T BS[BLOCK_K][BLOCK_N];
 
     for(T* a_ptr = AG, *b_ptr = BG; a_ptr < AG + K; a_ptr += BLOCK_K, b_ptr += BLOCK_K * N) {
         // 16 x 16
         // load block matrix A & B to share
-        for (int i = 0; i < WARP_M; i++) {
-            for(int j = 0; j < WARP_N; j++) {
-                // AS[(ty * WARP_M + i) * k + tx * WARP_N]
-                // AS[ty * WARP_M + i][tx * WARP_M + j] = a_ptr[(ty * WARP_M + i) * K + tx * WARP_M + j];
-                AS[ty * WARP_M + i][tx * WARP_M + j] = ELEME_OF(a_ptr, (ty * WARP_M + i),  tx * WARP_M + j, K);
-                // BS[ty * WARP_N + i][tx * WARP_N + j] = b_ptr[(ty * WARP_N + i) * N + tx * WARP_N + j];
-                BS[ty * WARP_N + i][tx * WARP_N + j] = ELEME_OF(b_ptr, (ty * WARP_N + i), tx * WARP_N + j, N);
+#pragma unroll
+        for (int i = 0; i < THREAD_M; i++) {
+            for(int j = 0; j < THREAD_N; j++) {
+                // AS[ty * THREAD_M + i][tx * THREAD_M + j] = a_ptr[(ty * THREAD_M + i) * K + tx * THREAD_M + j];
+                AS[ty * THREAD_M + i][tx * THREAD_M + j] = ELEME_OF(a_ptr, (ty * THREAD_M + i),  tx * THREAD_M + j, K);
+                // BS[ty * THREAD_N + i][tx * THREAD_N + j] = b_ptr[(ty * THREAD_N + i) * N + tx * THREAD_N + j];
+                BS[ty * THREAD_N + i][tx * THREAD_N + j] = ELEME_OF(b_ptr, (ty * THREAD_N + i), tx * THREAD_N + j, N);
             }
         }
 
         __syncthreads();
-        // compute block WARP_M * WARP_N into register
+        // compute block THREAD_M * THREAD_N into register
 #pragma unroll
 
-        for (int i = 0; i < WARP_M; i++) {
-            for(int j = 0; j < WARP_N; j++) {
+        for (int i = 0; i < THREAD_M; i++) {
+            for(int j = 0; j < THREAD_N; j++) {
                 for (int k = 0; k < BLOCK_K; k++)
-                    sum[i][j] = fmaf(AS[ty * WARP_M + i][k], BS[k][tx * WARP_N + j], sum[i][j]);
+                    sum[i][j] = fmaf(AS[ty * THREAD_M + i][k], BS[k][tx * THREAD_N + j], sum[i][j]);
             }
         }
 
         __syncthreads();
     }
 
-    for(int i = 0; i < WARP_M; i++) {
-        for(int j = 0; j < WARP_N; j++)
-            // CG[(ty * WARP_M + i) * N + tx * WARP_M + j] = sum[i][j];
-            ELEME_OF(CG, (ty * WARP_M + i), tx * WARP_M + j, N) = sum[i][j];
+    for(int i = 0; i < THREAD_M; i++) {
+        for(int j = 0; j < THREAD_N; j++)
+            // CG[(ty * THREAD_M + i) * N + tx * THREAD_M + j] = sum[i][j];
+            ELEME_OF(CG, (ty * THREAD_M + i), tx * THREAD_M + j, N) = sum[i][j];
     }
 }
 
-template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int WARP_M, int WARP_N>
+__global__ void static_shared_alloc(float* x, float* y)
+{
+    __shared__ float test[12 * 1024]; // 静态申请的共享内存只能这么大
+    int bx = blockIdx.x, tx = threadIdx.x;
+    test[tx * blockDim.x + bx] = x[bx * blockDim.x + tx] * 2;
+    y[bx * blockDim.x + tx] = test[bx * blockDim.x + tx];
+}
+
+// using double buffer to optimize the kernel ? 一次失败的尝试，不过这并不是ping pong只是增大了share memory，降低了并行度，反而引起了性能劣化
+/*
+256 x 256 x 256
+best of 17.38 us    (8, 8), (16, 16)  (2, 2)
+768 x 768 x 768
+best of 245.47 us   (24, 24), (16, 16)  (2, 2)
+1024 x 1024 x 1024
+best of 0.59 ms     (32, 32), (16, 16) (2, 2)
+2048 x 2048 x 2048
+best of 4.53 ms    (64, 64), (16, 16)  (2, 2)
+*/
+template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N, const bool ENABLE_DOUBLE_BUFFER = false>
+__global__ void matmul_v3_nn(T* A, T* B, T* C, int M, int N, int K)
+{
+    int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
+    T* AG = A + bx * BLOCK_M * K;
+    T* BG = B + by * BLOCK_N;
+    T* CG = C + bx * BLOCK_M * N + by * BLOCK_N;
+    T sum[THREAD_M][THREAD_N] = {zero<T>()};
+    __shared__ __align__(BLOCK_M * BLOCK_K * sizeof(T)) float AS[BLOCK_M][BLOCK_K * 2];
+    __shared__ __align__(BLOCK_M * BLOCK_K * sizeof(T)) float BS[2 * BLOCK_K][BLOCK_N];
+
+    for(T* a_ptr = AG, *b_ptr = BG; a_ptr < AG + K; a_ptr += 2 * BLOCK_K, b_ptr += 2  * BLOCK_K * N) {
+        for (int i = 0; i < THREAD_M; i++) {
+            for(int j = 0; j < THREAD_N; j++) {
+                AS[ty * THREAD_M + i][tx * THREAD_M + j] = ELEME_OF(a_ptr, (ty * THREAD_M + i),  tx * THREAD_M + j, K);
+                AS[ty * THREAD_M + i][tx * THREAD_M + j + BLOCK_K] = ELEME_OF(a_ptr, (ty * THREAD_M + i),  tx * THREAD_M + j + BLOCK_K, K);
+                BS[ty * THREAD_N + i][tx * THREAD_N + j] = ELEME_OF(b_ptr, (ty * THREAD_N + i), tx * THREAD_N + j, N);
+                BS[ty * THREAD_N + i + BLOCK_K][tx * THREAD_N + j] = ELEME_OF(b_ptr, (ty * THREAD_N + i + BLOCK_K), tx * THREAD_N + j, N);
+            }
+        }
+
+        __syncthreads();
+
+        for (int i = 0; i < THREAD_M; i++) {
+            for (int j = 0; j < THREAD_N; j++) {
+                for (int k = 0; k < 2 * BLOCK_K; k++)
+                    sum[i][j] = fmaf(AS[ty * THREAD_M + i][k], BS[k][tx * THREAD_N + j], sum[i][j]);
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+
+    for(int i = 0; i < THREAD_M; i++) {
+        for(int j = 0; j < THREAD_N; j++)
+            ELEME_OF(CG, (ty * THREAD_M + i), tx * THREAD_M + j, N) = sum[i][j];
+    }
+}
+
+// gmem -> smem 使用interleave的方式加载
+// 
+template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N, const bool ENABLE_DOUBLE_BUFFER = false>
+__global__ void matmul_v4_nn(T* A, T* B, T* C, int M, int N, int K)
+{
+    int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
+    T* AG = A + bx * BLOCK_M * K;
+    T* BG = B + by * BLOCK_N;
+    T* CG = C + bx * BLOCK_M * N + by * BLOCK_N;
+}
+
+
+template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N>
 void matmul_wrapper(T* A, T* B, T* C, int M, int N, int K, dim3 grid, dim3 block, Major major)
 {
     if (major == RowMajor)
-        matmul_nn<T, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N> <<< grid, block>>>(A, B, C, M, N, K);
+        matmul_nn<T, BLOCK_M, BLOCK_N, BLOCK_K, THREAD_M, THREAD_N> <<< grid, block>>>(A, B, C, M, N, K);
     else if (major == ColMajor)
         assert(false);
 }
@@ -351,6 +431,7 @@ int main(int argc, char** argv)
         cout << "running test M = " << M << " M = " << N << " K = " << K << " grid (" << grid.x << ", " << grid.y << ")"
             << " block (" << block.x << ", " << block.y << ")" << endl;
         auto kernel_wrapper = query_kernel(testcase.first);
+        // static_shared_alloc<<<grid, block>>>((float*)d_A, (float*)d_B);
         kernel_wrapper((float*)d_A, (float*)d_B, (float*)d_C, M, N, K, grid, block, RowMajor);
         CHECK_CALL_ERROR(cudaMemcpy(h_C, d_C, bytes_of<float>(M * N), cudaMemcpyDeviceToHost));
         cout << count_large_diff((float*)h_C, expects[i], M * N, 1e-3, 1e-3) << "/" << M* N << " differs." << endl;
