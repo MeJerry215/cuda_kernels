@@ -396,8 +396,8 @@ __global__ void matmul_v4_nn(T* A, T* B, T* C, int M, int N, int K)
     __shared__ T __align__(BLOCK_M * BLOCK_K * sizeof(T)) ashare[BLOCK_K * BLOCK_M];
     // 从B 加载 8, 128 到BS的是 8, 128
     __shared__ T __align__(BLOCK_N * BLOCK_K * sizeof(T)) bshare[BLOCK_K * BLOCK_N];
-    float sum[8][8] = {0};
-    float panelA[8] = {0}, panelB[8] = {0};
+    float sum[THREAD_M][THREAD_N] = {0};
+    float panelA[THREAD_M] = {0}, panelB[THREAD_N] = {0};
     int from_a = (by * BLOCK_M + tx / BLOCK_K * 4) * K + tx % BLOCK_K;
     // load b 最小使用了一个warp size, 保证可以合并访存 32 * 4 = 128bytes  1个transaction可以加载完。
     int from_b = (tx / WARP_SIZE) * N + bx * BLOCK_N + tx % WARP_SIZE;
@@ -442,8 +442,8 @@ __global__ void matmul_v4_nn(T* A, T* B, T* C, int M, int N, int K)
                 panelB[i + 4] = ptrB[i + 64];
             }
 
-            for (int i = 0; i < 8; ++i) {
-                for (int j = 0; j < 8; ++j)
+            for (int i = 0; i < THREAD_M; ++i) {
+                for (int j = 0; j < THREAD_N; ++j)
                     sum[i][j] += panelA[i] * panelB[j];
             }
         }
