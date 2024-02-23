@@ -377,9 +377,6 @@ __global__ void matmul_v3_nn(T* A, T* B, T* C, int M, int N, int K)
     }
 }
 
-#define SMEM_LDA (128)
-#define SMEM_LDB (128)
-
 // gmem -> smem 使用interleave的方式加载 1个warp内32 threads 访问连续索引的32个float 总共访问128bytes，可以合并为一个transacation
 /*
 256 x 256 x 256
@@ -409,35 +406,36 @@ __global__ void matmul_v4_nn(T* A, T* B, T* C, int M, int N, int K)
 
     for (int k = 0; k < K; k += BLOCK_K) {
         // part1: gmem to smem
-        // load gmem to smem for ashare
-        int to_a = (tx % BLOCK_K) * BLOCK_M + (tx / BLOCK_K) * 4; // 连续的地址不能给同一个 thread 用  transpose addr
+        int to_a = (tx % BLOCK_K) * BLOCK_M + (tx / BLOCK_K) * 4;  // and doing transpose store
 
-        for (int i = 0; i < load_a_cnt; ++i)
+        // 这里需要循环展开，循环展开能有20% 性能提升
+        for (int i = 0; i < load_a_cnt; ++i)  // 这里存在8-way bank 冲突load_a_cnt = 8, 0-7 8-15 16-23 24-31 都写在一个bank 里
             ashare[to_a + i] = A[from_a + i * K];
 
-        // load gmem to smem for bshare
+
         int to_b = (tx / WARP_SIZE) * BLOCK_N + (tx % WARP_SIZE);
 
-        for (int i = 0; i < load_b_cnt; ++i)
+        // 这里需要循环展开，循环展开能有20% 性能提升
+        for (int i = 0; i < load_b_cnt; ++i) // 这里没有bank 冲突
             bshare[to_b + i * WARP_SIZE] = B[from_b + i * WARP_SIZE]; // 32 thread 合并访问。 thread i 访问  [i, i+32, i+64, i+96]
 
         __syncthreads();
-        from_a += 8;
-        from_b += 8 * N;
+        from_a += BLOCK_K;
+        from_b += BLOCK_K * N;
         // part2: calculation
         // 计算 2x2 个 4x4
         int aidx0 = (tx / 16) * 4;
         int bidx0 = (tx % 16) * 4;
 
         for (int subk = 0; subk < 8; ++subk) {
-            float* ptrA = ashare + aidx0 + subk * SMEM_LDA;
+            float* ptrA = ashare + aidx0 + subk * BLOCK_M;
 
             for (int i = 0; i < 4; ++i) {
                 panelA[i] = ptrA[i];
                 panelA[i + 4] = ptrA[i + 64];
             }
 
-            const float* ptrB = bshare + bidx0 + subk * SMEM_LDB;
+            const float* ptrB = bshare + bidx0 + subk * BLOCK_N;
 
             for (int i = 0; i < 4; ++i) {
                 panelB[i] = ptrB[i];
