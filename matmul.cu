@@ -91,7 +91,7 @@ void generate_testcase_v3(vector<pair<vector<int>, vector<int>>>& testcases, int
 
 void generate_testcase_v4(vector<pair<vector<int>, vector<int>>>& testcases, int M, int N, int K)
 {
-    testcases.push_back(make_pair<vector<int>, vector<int>>({128, 128, 0, 8, 8}, {M, N, K}));
+    testcases.push_back(make_pair<vector<int>, vector<int>>({128, 128, 8, 8, 8}, {M, N, K}));
 }
 
 
@@ -132,7 +132,7 @@ void register_kernels()
     REGISTER_FLOAT_KERNEL(32, 32, 32, 2, 2);
     REGISTER_FLOAT_KERNEL(32, 32, 32, 4, 4);
 #elif defined(V4)
-    REGISTER_FLOAT_KERNEL(128, 128, 0, 8, 8);
+    REGISTER_FLOAT_KERNEL(128, 128, 8, 8, 8);
 #endif
 }
 
@@ -395,28 +395,31 @@ template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int TH
 __global__ void matmul_v4_nn(T* A, T* B, T* C, int M, int N, int K)
 {
     int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x;
-    // float* ashare = reinterpret_cast<float*>(smem);
-    // float* bshare = reinterpret_cast<float*>(smem + 16 * 1024);  // 8k shared mem for B
-    __shared__ float __align__(16 * 1024) ashare[4 * 1024];
-    __shared__ float __align__(16 * 1024) bshare[2 * 1024];
+    // 从A 加载 128, 8 到AS的是 8, 128
+    __shared__ T __align__(BLOCK_M * BLOCK_K * sizeof(T)) ashare[BLOCK_K * BLOCK_M];
+    // 从B 加载 8, 128 到BS的是 8, 128
+    __shared__ T __align__(BLOCK_N * BLOCK_K * sizeof(T)) bshare[BLOCK_K * BLOCK_N];
     float sum[8][8] = {0};
     float panelA[8] = {0}, panelB[8] = {0};
-    int from_a = (by * 128 + tx / 8 * 4) * K + tx % 8;
-    int from_b = (tx / 32) * N + bx * 128 + tx % 32;
+    int from_a = (by * BLOCK_M + tx / BLOCK_K * 4) * K + tx % BLOCK_K;
+    // load b 最小使用了一个warp size, 保证可以合并访存 32 * 4 = 128bytes  1个transaction可以加载完。
+    int from_b = (tx / WARP_SIZE) * N + bx * BLOCK_N + tx % WARP_SIZE;
+    int load_a_cnt = BLOCK_M * BLOCK_K / blockDim.x;
+    int load_b_cnt = BLOCK_N * BLOCK_K / blockDim.x;
 
-    for (int loop = 0; loop < K; loop += 8) {
+    for (int k = 0; k < K; k += BLOCK_K) {
         // part1: gmem to smem
         // load gmem to smem for ashare
-        int to_a = (tx % 8) * SMEM_LDA + (tx / 8) * 4; // 连续的地址不能给同一个 thread 用  transpose addr
+        int to_a = (tx % BLOCK_K) * BLOCK_M + (tx / BLOCK_K) * 4; // 连续的地址不能给同一个 thread 用  transpose addr
 
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < load_a_cnt; ++i)
             ashare[to_a + i] = A[from_a + i * K];
 
         // load gmem to smem for bshare
-        int to_b = (tx / 32) * SMEM_LDB + (tx % 32);
+        int to_b = (tx / WARP_SIZE) * BLOCK_N + (tx % WARP_SIZE);
 
-        for (int i = 0; i < 4; ++i)
-            bshare[to_b + i * 32] = B[from_b + i * 32]; // 32 thread 合并访问。 thread i 访问  [i, i+32, i+64, i+96]
+        for (int i = 0; i < load_b_cnt; ++i)
+            bshare[to_b + i * WARP_SIZE] = B[from_b + i * WARP_SIZE]; // 32 thread 合并访问。 thread i 访问  [i, i+32, i+64, i+96]
 
         __syncthreads();
         from_a += 8;
@@ -489,7 +492,7 @@ int main(int argc, char** argv)
     REGISTER_BUFF(B, bytes_of<float>(MAX_N * MAX_K));
     REGISTER_BUFF(C, bytes_of<float>(MAX_M * MAX_N));
     genOrLoad<float>(string("bin/matmul_A_4096_4096_float32.bin"), h_A, MAX_M * MAX_K);
-    genOrLoad<float>(string("bin/matmul_B_4096_4096_float32.bin"), h_A, MAX_M * MAX_K);
+    genOrLoad<float>(string("bin/matmul_B_4096_4096_float32.bin"), h_B, MAX_M * MAX_K);
     auto expects = gen_exp_cpu((float*)h_A, (float*)h_B, testcases);
     CHECK_CALL_ERROR(cudaMemcpy(d_A, h_A, bytes_of<float>(MAX_M * MAX_K), cudaMemcpyHostToDevice));
     CHECK_CALL_ERROR(cudaMemcpy(d_B, h_B, bytes_of<float>(MAX_K * MAX_N), cudaMemcpyHostToDevice));

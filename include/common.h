@@ -48,7 +48,6 @@ using std::ofstream;
 
 const unsigned int SEED = 42;
 
-const int WARP_SIZE = 32;
 const int max_block_threads = 1024;
 const int A10_SM_CNT = 72;
 const int A10_SP_CNT = 128;
@@ -58,6 +57,7 @@ enum Major {
     ColMajor = 0,
 };
 
+#define WARP_SIZE warpSize
 #define OF_DEVICE_FUNCTION __device__ __host__ __forceinline__
 #define DEVICE_FUNCTION __device__ __forceinline__
 #define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
@@ -334,7 +334,7 @@ struct TenarayFunctor {
     virtual DEVICE_FUNCTION T operator()(T x, T y, T z) const = 0;
 };
 
-size_t count_large_diff(const float* a, const float* b, size_t n, float atol, float rtol)
+size_t count_large_diff(const float* a, const float* b, size_t n, float atol, float rtol, int n_print = 8, int row_num = 8)
 {
     size_t count = 0;
 
@@ -348,6 +348,14 @@ size_t count_large_diff(const float* a, const float* b, size_t n, float atol, fl
             count++;
     }
 
+    for(int i = 0; i < n_print; i++) {
+        printf("%8.2f", a[i]);
+
+        if ((i + 1) % row_num == 0)
+            printf("\n");
+    }
+
+    printf("\n");
     // cout << endl;
     return count;
 }
@@ -418,13 +426,13 @@ void* load_from_file(const char* filename, size_t& dataSize, void* outputPtr = n
 }
 
 template<typename T>
-void genOrLoad(const string &filename, void *ptr, size_t n_elems) {
+void genOrLoad(const string& filename, void* ptr, size_t n_elems)
+{
     if (fileExists(filename)) {
         size_t dataSize = 0;
         load_from_file(filename.c_str(), dataSize, ptr);
-    } else {
+    } else
         gen_random<T>((T*)ptr, n_elems);
-    }
 }
 
 template <typename T>
