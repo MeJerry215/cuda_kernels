@@ -1,6 +1,6 @@
 #include "common.h"
 
-#define V3
+#define V4
 
 #ifdef V0
     #define matmul_nn matmul_v0_nn
@@ -19,7 +19,9 @@
     #define generate_testcase generate_testcase_v3
     #define CASE1
 #elif defined(V4)
-
+    #define matmul_nn matmul_v4_nn
+    #define generate_testcase generate_testcase_v4
+    #define CASE2
 #endif
 
 #define REGISTER_KERNEL(dtype, BM, BN, BK, WM, WN) \
@@ -87,6 +89,12 @@ void generate_testcase_v3(vector<pair<vector<int>, vector<int>>>& testcases, int
     testcases.push_back(make_pair<vector<int>, vector<int>>({32, 32, 32, 4, 4}, {M, N, K}));
 }
 
+void generate_testcase_v4(vector<pair<vector<int>, vector<int>>>& testcases, int M, int N, int K)
+{
+    testcases.push_back(make_pair<vector<int>, vector<int>>({128, 128, 0, 8, 8}, {M, N, K}));
+}
+
+
 void register_kernels()
 {
 #ifdef V0
@@ -123,6 +131,8 @@ void register_kernels()
     REGISTER_FLOAT_KERNEL(16, 16, 16, 2, 2);
     REGISTER_FLOAT_KERNEL(32, 32, 32, 2, 2);
     REGISTER_FLOAT_KERNEL(32, 32, 32, 4, 4);
+#elif defined(V4)
+    REGISTER_FLOAT_KERNEL(128, 128, 0, 8, 8);
 #endif
 }
 
@@ -307,15 +317,15 @@ __global__ void matmul_v2_nn(T* A, T* B, T* C, int M, int N, int K)
     }
 }
 
-__global__ void static_shared_alloc(float* x, float* y)
-{
-    __shared__ float test[12 * 1024]; // 静态申请的共享内存只能这么大
-    int bx = blockIdx.x, tx = threadIdx.x;
-    test[tx * blockDim.x + bx] = x[bx * blockDim.x + tx] * 2;
-    y[bx * blockDim.x + tx] = test[bx * blockDim.x + tx];
-}
+// __global__ void static_shared_alloc(float* x, float* y)
+// {
+//     __shared__ float test[12 * 1024]; // 静态申请的共享内存只能这么大 48K
+//     int bx = blockIdx.x, tx = threadIdx.x;
+//     test[tx * blockDim.x + bx] = x[bx * blockDim.x + tx] * 2;
+//     y[bx * blockDim.x + tx] = test[bx * blockDim.x + tx];
+// }
 
-// using double buffer to optimize the kernel ? 一次失败的尝试，不过这并不是ping pong只是增大了share memory，降低了并行度，反而引起了性能劣化
+// using double buffer to optimize the kernel ? 只是增大了share memory，降低了并行度，反而引起了性能劣化
 /*
 256 x 256 x 256
 best of 17.38 us    (8, 8), (16, 16)  (2, 2)
@@ -367,15 +377,90 @@ __global__ void matmul_v3_nn(T* A, T* B, T* C, int M, int N, int K)
     }
 }
 
-// gmem -> smem 使用interleave的方式加载
-// 
+#define SMEM_LDA (128)
+#define SMEM_LDB (128)
+
+// gmem -> smem 使用interleave的方式加载 1个warp内32 threads 访问连续索引的32个float 总共访问128bytes，可以合并为一个transacation
+/*
+256 x 256 x 256
+best of 109.54 us   (2, 2), (256)
+768 x 768 x 768
+best of 299.62 us   (6, 6), (256)
+1024 x 1024 x 1024
+best of 0.40 ms     (8, 8), (256)
+2048 x 2048 x 2048
+best of 2.25 ms     (16, 16), (256)
+*/
 template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N, const bool ENABLE_DOUBLE_BUFFER = false>
 __global__ void matmul_v4_nn(T* A, T* B, T* C, int M, int N, int K)
 {
-    int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x, ty = threadIdx.y;
-    T* AG = A + bx * BLOCK_M * K;
-    T* BG = B + by * BLOCK_N;
-    T* CG = C + bx * BLOCK_M * N + by * BLOCK_N;
+    int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x;
+    // float* ashare = reinterpret_cast<float*>(smem);
+    // float* bshare = reinterpret_cast<float*>(smem + 16 * 1024);  // 8k shared mem for B
+    __shared__ float __align__(16 * 1024) ashare[4 * 1024];
+    __shared__ float __align__(16 * 1024) bshare[2 * 1024];
+    float sum[8][8] = {0};
+    float panelA[8] = {0}, panelB[8] = {0};
+    int from_a = (by * 128 + tx / 8 * 4) * K + tx % 8;
+    int from_b = (tx / 32) * N + bx * 128 + tx % 32;
+
+    for (int loop = 0; loop < K; loop += 8) {
+        // part1: gmem to smem
+        // load gmem to smem for ashare
+        int to_a = (tx % 8) * SMEM_LDA + (tx / 8) * 4; // 连续的地址不能给同一个 thread 用  transpose addr
+
+        for (int i = 0; i < 4; ++i)
+            ashare[to_a + i] = A[from_a + i * K];
+
+        // load gmem to smem for bshare
+        int to_b = (tx / 32) * SMEM_LDB + (tx % 32);
+
+        for (int i = 0; i < 4; ++i)
+            bshare[to_b + i * 32] = B[from_b + i * 32]; // 32 thread 合并访问。 thread i 访问  [i, i+32, i+64, i+96]
+
+        __syncthreads();
+        from_a += 8;
+        from_b += 8 * N;
+        // part2: calculation
+        // 计算 2x2 个 4x4
+        int aidx0 = (tx / 16) * 4;
+        int bidx0 = (tx % 16) * 4;
+
+        for (int subk = 0; subk < 8; ++subk) {
+            float* ptrA = ashare + aidx0 + subk * SMEM_LDA;
+
+            for (int i = 0; i < 4; ++i) {
+                panelA[i] = ptrA[i];
+                panelA[i + 4] = ptrA[i + 64];
+            }
+
+            const float* ptrB = bshare + bidx0 + subk * SMEM_LDB;
+
+            for (int i = 0; i < 4; ++i) {
+                panelB[i] = ptrB[i];
+                panelB[i + 4] = ptrB[i + 64];
+            }
+
+            for (int i = 0; i < 8; ++i) {
+                for (int j = 0; j < 8; ++j)
+                    sum[i][j] += panelA[i] * panelB[j];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // part3: save to C
+    int write_offset = (by * 128 + (tx / 16) * 4) * N + bx * 128 + (tx % 16) * 4;
+
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            C[write_offset + i * N + j] = sum[i][j];
+            C[write_offset + i * N + j + 64] = sum[i][j + 4];
+            C[write_offset + (i + 64) * N + j] = sum[i + 4][j];
+            C[write_offset + (i + 64) * N + j + 64] = sum[i + 4][j + 4];
+        }
+    }
 }
 
 
@@ -396,9 +481,9 @@ int main(int argc, char** argv)
     const int MAX_M = 4096, MAX_N = 4096, MAX_K = 4096;
     vector<pair<vector<int>, vector<int>>> testcases = {
     };
-    // generate_testcase(testcases, 256, 256, 256);
-    // generate_testcase(testcases, 768, 768, 768);
-    // generate_testcase(testcases, 1024, 1024, 1024);
+    generate_testcase(testcases, 256, 256, 256);
+    generate_testcase(testcases, 768, 768, 768);
+    generate_testcase(testcases, 1024, 1024, 1024);
     generate_testcase(testcases, 2048, 2048, 2048);
     REGISTER_BUFF(A, bytes_of<float>(MAX_M * MAX_K));
     REGISTER_BUFF(B, bytes_of<float>(MAX_N * MAX_K));
@@ -418,14 +503,16 @@ int main(int argc, char** argv)
         int block_x = testcase.first[0];
         int block_y = testcase.first[1];
         int block_k = testcase.first[2];
-        int warp_x = testcase.first[3];
-        int warp_y = testcase.first[4];
+        int thread_x = testcase.first[3];
+        int thread_y = testcase.first[4];
         int grid_x = (M + block_x - 1) / block_x;
         int grid_y = (N + block_y - 1) / block_y;
 #ifdef CASE0
         dim3 block(block_x, block_y);
 #elif defined(CASE1)
-        dim3 block(block_x / warp_x, block_y / warp_y);
+        dim3 block(block_x / thread_x, block_y / thread_y);
+#elif defined(CASE2)
+        dim3 block(256);
 #endif
         dim3 grid(grid_x, grid_y);
         cout << "running test M = " << M << " M = " << N << " K = " << K << " grid (" << grid.x << ", " << grid.y << ")"
