@@ -28,7 +28,7 @@ inline cudaError_t GetNumBlocks(int64_t n, int* num_blocks)
     int maxBlocksPerSM;
     cudaDeviceGetAttribute(&maxBlocksPerSM, cudaDevAttrMaxBlocksPerMultiprocessor, dev);
 
-    std::cout << "Maximum blocks per SM: " << maxBlocksPerSM << std::endl;
+    std::cout << "Maximum blocks per SM: " << maxBlocksPerSM << " tpm: " << tpm << " sm_count "  << sm_count << std::endl;
     cout << sm_count << " " << tpm << endl;
     *num_blocks = std::max<int>(1, std::min<int64_t>((n + kBlockSize - 1) / kBlockSize,
                 sm_count * tpm / kBlockSize * kNumWaves));

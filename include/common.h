@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <cuda_fp16.h>
 #include <vector_functions.h>
 #include <vector>
@@ -45,6 +46,7 @@ using std::fixed;
 using std::setprecision;
 using std::ifstream;
 using std::ofstream;
+using std::enable_if;
 
 const unsigned int SEED = 42;
 
@@ -57,7 +59,7 @@ enum Major {
     ColMajor = 0,
 };
 
-#define WARP_SIZE warpSize
+#define WARP_SIZE 32
 #define OF_DEVICE_FUNCTION __device__ __host__ __forceinline__
 #define DEVICE_FUNCTION __device__ __forceinline__
 #define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
@@ -189,6 +191,8 @@ DTYPE checkType()
         return UNK_TYPE;
 }
 
+
+
 template<typename T>
 T random_value()
 {
@@ -236,48 +240,6 @@ void gen_random(T* data, size_t n_elems)
         data[n_elems] = random_value<T>();
 }
 
-inline int _ConvertSMVer2Cores(int major, int minor)
-{
-    typedef struct {
-        int SM;
-        int Cores;
-    } sSMtoCores;
-    sSMtoCores nGpuArchCoresPerSM[] = {
-        {0x30, 192},
-        {0x32, 192},
-        {0x35, 192},
-        {0x37, 192},
-        {0x50, 128},
-        {0x52, 128},
-        {0x53, 128},
-        {0x60,  64},
-        {0x61, 128},
-        {0x62, 128},
-        {0x70,  64},
-        {0x72,  64},
-        {0x75,  64},
-        {0x80,  64},
-        {0x86, 128},
-        {0x87, 128},
-        {0x89, 128},
-        {0x90, 128},
-        {-1, -1}
-    };
-    int index = 0;
-
-    while (nGpuArchCoresPerSM[index].SM != -1) {
-        if (nGpuArchCoresPerSM[index].SM == ((major << 4) + minor))
-            return nGpuArchCoresPerSM[index].Cores;
-
-        index++;
-    }
-
-    printf(
-        "MapSMtoCores for SM %d.%d is undefined."
-        "  Default to use %d Cores/SM\n",
-        major, minor, nGpuArchCoresPerSM[index - 1].Cores);
-    return nGpuArchCoresPerSM[index - 1].Cores;
-}
 
 inline pair<int, int> query_capability(int device = 0)
 {
@@ -289,15 +251,131 @@ inline pair<int, int> query_capability(int device = 0)
     return {major, minor};
 }
 
-inline pair<int, int> query_mp_sp(int device = 0)
+
+inline cudaError_t GetNumBlocks(int64_t block_size, int64_t max_blocks, int64_t waves,
+    int* num_blocks)
 {
-    int smCount = 0;
-    auto capability = query_capability(device);
-    CHECK_CALL_ERROR(cudaSetDevice(device));
-    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
-    int spPerSM = _ConvertSMVer2Cores(capability.first, capability.second);
-    return {smCount, spPerSM};
+    int dev;
+    {
+        cudaError_t err = cudaGetDevice(&dev);
+
+        if (err != cudaSuccess)  return err;
+    }
+    int sm_count;
+    {
+        cudaError_t err = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+
+        if (err != cudaSuccess)  return err;
+    }
+    int tpm;
+    {
+        cudaError_t err = cudaDeviceGetAttribute(&tpm, cudaDevAttrMaxThreadsPerMultiProcessor, dev);
+
+        if (err != cudaSuccess)  return err;
+    }
+    *num_blocks =
+        std::max<int>(1, std::min<int64_t>(max_blocks, sm_count * tpm / block_size * waves));
+    return cudaSuccess;
 }
+
+// inline pair<int, int> query_mp_sp(int device = 0)
+// {
+//     int smCount = 0;
+//     auto capability = query_capability(device);
+//     CHECK_CALL_ERROR(cudaSetDevice(device));
+//     CHECK_CALL_ERROR(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
+//     int spPerSM = _ConvertSMVer2Cores(capability.first, capability.second);
+//     return {smCount, spPerSM};
+// }
+/*
+total_bandwidth_per_sm = memory_clock_rate * global_memory_bus_width / 8
+max_blocks_per_sm = max_threads_per_multi_processor / max_threads_per_block
+average_bandwidth_per_sm = total_bandwidth_per_sm / max_blocks_per_sm
+total_bandwidth = average_bandwidth_per_sm * multi_processor_count
+6251000 * 384 / 8  * 1024 / 1536 * 72 = 13.4 测试最大 h2d 12.3 d2h 13.2
+
+compute capability:                    8.6
+max_threads_per_block:                 1024
+max_shared_memory_per_block:           49152
+warp_size:                             32
+max_registers_per_block:               65536
+clock_rate:                            1695000
+multi_processor_count:                 72
+memory_clock_rate:                     6251000
+global_memory_bus_width:               384
+l2_cache_size:                         6291456
+max_threads_per_multi_processor:       1536
+max_shared_memory_per_multi_processor: 102400
+max_registers_per_multi_processor:     65536
+max_blocks_per_multi_processor:        16
+
+ Device 0: NVIDIA A10
+ Quick Mode
+ Host to Device Bandwidth, 1 Device(s)
+ PINNED Memory Transfers
+   Transfer Size (Bytes)        Bandwidth(GB/s)
+   32000000                     12.3
+
+ Device to Host Bandwidth, 1 Device(s)
+ PINNED Memory Transfers
+   Transfer Size (Bytes)        Bandwidth(GB/s)
+   32000000                     13.2
+
+ Device to Device Bandwidth, 1 Device(s)
+ PINNED Memory Transfers
+   Transfer Size (Bytes)        Bandwidth(GB/s)
+   32000000                     471.0
+*/
+inline void query_device(int device = 0)
+{
+    CHECK_CALL_ERROR(cudaSetDevice(device));
+    int major = 0;
+    int minor = 0;
+    int max_threads_per_block = 0;
+    int max_shared_memory_per_block = 0;
+    int warp_size = 0;
+    int max_registers_per_block = 0;
+    int clock_rate = 0;
+    int multi_processor_count = 0;
+    int memory_clock_rate = 0;
+    int global_memory_bus_width = 0;
+    int l2_cache_size = 0;
+    int max_threads_per_multi_processor = 0;
+    int max_shared_memory_per_multi_processor = 0;
+    int max_registers_per_multi_processor = 0;
+    int max_blocks_per_multi_processor = 0;
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&max_threads_per_block, cudaDevAttrMaxThreadsPerBlock, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&max_shared_memory_per_block, cudaDevAttrMaxSharedMemoryPerBlock, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&max_registers_per_block, cudaDevAttrMaxRegistersPerBlock, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&clock_rate, cudaDevAttrClockRate, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&memory_clock_rate, cudaDevAttrMemoryClockRate, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&global_memory_bus_width, cudaDevAttrGlobalMemoryBusWidth, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&max_threads_per_multi_processor, cudaDevAttrMaxThreadsPerMultiProcessor, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&max_shared_memory_per_multi_processor, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+            device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&max_registers_per_multi_processor, cudaDevAttrMaxRegistersPerMultiprocessor, device));
+    CHECK_CALL_ERROR(cudaDeviceGetAttribute(&max_blocks_per_multi_processor, cudaDevAttrMaxBlocksPerMultiprocessor, device));
+    cout << "compute capability:                    " << major << "." << minor << endl;
+    cout << "max_threads_per_block:                 " << max_threads_per_block << endl;
+    cout << "max_shared_memory_per_block:           " << max_shared_memory_per_block << endl;
+    cout << "warp_size:                             " << warp_size << endl;
+    cout << "max_registers_per_block:               " << max_registers_per_block << endl;
+    cout << "clock_rate:                            " << clock_rate << endl;
+    cout << "multi_processor_count:                 " << multi_processor_count << endl;
+    cout << "memory_clock_rate:                     " << memory_clock_rate << endl;
+    cout << "global_memory_bus_width:               " << global_memory_bus_width << endl;
+    cout << "l2_cache_size:                         " << l2_cache_size << endl;
+    cout << "max_threads_per_multi_processor:       " << max_threads_per_multi_processor << endl;
+    cout << "max_shared_memory_per_multi_processor: " << max_shared_memory_per_multi_processor << endl;
+    cout << "max_registers_per_multi_processor:     " << max_registers_per_multi_processor << endl;
+    cout << "max_blocks_per_multi_processor:        " << max_blocks_per_multi_processor << endl;
+}
+
 
 template<typename T>
 struct UnaryFunctor {
@@ -480,7 +558,85 @@ DEVICE_FUNCTION int8_t zero<int8_t>()
     return 0;
 }
 
+template<typename T>
+struct DefaultComputeType {
+    using type = T;
+};
 
+template<>
+struct DefaultComputeType<half> {
+    using type = float;
+};
+
+
+template<typename T>
+__inline__ __device__ T Inf();
+
+template<>
+__inline__ __device__ float Inf<float>()
+{
+    return CUDART_INF_F;
+}
+
+template<>
+__inline__ __device__ double Inf<double>()
+{
+    return CUDART_INF;
+}
+
+template<typename T, int N>
+struct GetPackType {
+    using type = typename std::aligned_storage<N* sizeof(T), N* sizeof(T)>::type;
+};
+
+template<typename T, int N>
+using PackType = typename GetPackType<T, N>::type;
+
+template<typename T, int N>
+union Pack {
+    static_assert(sizeof(PackType<T, N>) == sizeof(T) * N, "");
+    __device__ Pack() {
+        // do nothing
+    }
+    PackType<T, N> storage;
+    T elem[N];
+};
+
+
+template<typename SRC, typename DST>
+struct DirectLoad {
+    DirectLoad(const SRC* src, int64_t row_size) : src(src), row_size(row_size) {}
+    template<int N>
+    __device__ void load(DST* dst, int64_t row, int64_t col) const
+    {
+        Pack<SRC, N> pack;
+        const int64_t offset = (row * row_size + col) / N;
+        pack.storage = *(reinterpret_cast<const PackType<SRC, N>*>(src) + offset);
+#pragma unroll
+        // 但是这里我没有看到vectorsize
+        for (int i = 0; i < N; ++i)  dst[i] = static_cast<DST>(pack.elem[i]);
+    }
+    const SRC* src;
+    int64_t row_size;
+};
+
+template<typename SRC, typename DST>
+struct DirectStore {
+    DirectStore(DST* dst, int64_t row_size) : dst(dst), row_size(row_size) {}
+    template<int N>
+    __device__ void store(const SRC* src, int64_t row, int64_t col)
+    {
+        Pack<DST, N> pack;
+        const int64_t offset = (row * row_size + col) / N;
+#pragma unroll
+
+        for (int i = 0; i < N; ++i)  pack.elem[i] = static_cast<DST>(src[i]);
+
+        *(reinterpret_cast<PackType<DST, N>*>(dst) + offset) = pack.storage;
+    }
+    DST* dst;
+    int64_t row_size;
+};
 
 namespace std
 {

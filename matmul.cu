@@ -396,50 +396,56 @@ __global__ void matmul_v4_nn(T* A, T* B, T* C, int M, int N, int K)
     __shared__ T __align__(BLOCK_M * BLOCK_K * sizeof(T)) ashare[BLOCK_K * BLOCK_M];
     // 从B 加载 8, 128 到BS的是 8, 128
     __shared__ T __align__(BLOCK_N * BLOCK_K * sizeof(T)) bshare[BLOCK_K * BLOCK_N];
+    constexpr int MICRO_M = 4;
+    constexpr int MICRO_N = 4;
     float sum[THREAD_M][THREAD_N] = {0};
     float panelA[THREAD_M] = {0}, panelB[THREAD_N] = {0};
     int from_a = (by * BLOCK_M + tx / BLOCK_K * 4) * K + tx % BLOCK_K;
     // load b 最小使用了一个warp size, 保证可以合并访存 32 * 4 = 128bytes  1个transaction可以加载完。
     int from_b = (tx / WARP_SIZE) * N + bx * BLOCK_N + tx % WARP_SIZE;
-    int load_a_cnt = BLOCK_M * BLOCK_K / blockDim.x;
-    int load_b_cnt = BLOCK_N * BLOCK_K / blockDim.x;
+    constexpr int LOAD_A_CNT = BLOCK_M * BLOCK_K / (BLOCK_M  * BLOCK_N / THREAD_M / THREAD_N);
+    constexpr int LOAD_B_CNT = BLOCK_N * BLOCK_K / (BLOCK_M  * BLOCK_N / THREAD_M / THREAD_N);
+    constexpr int STRIDE_M = BLOCK_M / (THREAD_M / MICRO_M);
+    constexpr int STRIDE_N = BLOCK_N / (THREAD_N / MICRO_N);
 
     for (int k = 0; k < K; k += BLOCK_K) {
         // part1: gmem to smem
-        int to_a = (tx % BLOCK_K) * BLOCK_M + (tx / BLOCK_K) * 4;  // and doing transpose store
+        int to_a = (tx % BLOCK_K) * BLOCK_M + tx / BLOCK_K * 4;  // and doing transpose store
 
         // 这里需要循环展开，循环展开能有20% 性能提升
-        for (int i = 0; i < load_a_cnt; ++i)  // 这里存在8-way bank 冲突load_a_cnt = 8, 0-7 8-15 16-23 24-31 都写在一个bank 里
+        for (int i = 0; i < LOAD_A_CNT; ++i)
+            // store 这里存在8-way bank 冲突load_a_cnt = 8, 0-7 8-15 16-23 24-31 都写在一个bank 里
             ashare[to_a + i] = A[from_a + i * K];
 
+        int to_b = tx / WARP_SIZE * BLOCK_N + (tx % WARP_SIZE);
 
-        int to_b = (tx / WARP_SIZE) * BLOCK_N + (tx % WARP_SIZE);
-
-        // 这里需要循环展开，循环展开能有20% 性能提升
-        for (int i = 0; i < load_b_cnt; ++i) // 这里没有bank 冲突
-            bshare[to_b + i * WARP_SIZE] = B[from_b + i * WARP_SIZE]; // 32 thread 合并访问。 thread i 访问  [i, i+32, i+64, i+96]
+        // 这里需要循环展开，循环展开能有20% 性能提升, 循环展开需要unroll
+        for (int i = 0; i < LOAD_B_CNT; ++i) // 这里没有bank 冲突
+            // 32 thread 合并访问。 thread i 访问  [i, i+32, i+64, i+96]
+            bshare[to_b + i * WARP_SIZE] = B[from_b + i * WARP_SIZE];
 
         __syncthreads();
         from_a += BLOCK_K;
         from_b += BLOCK_K * N;
         // part2: calculation
-        // 计算 2x2 个 4x4  8x128 AS 8x128 BS compute
-        int aidx0 = (tx / 16) * 4;
-        int bidx0 = (tx % 16) * 4;
+        // 计算 2x2 个 4x4  8x128 AS 8x128 BS compute 对于block 来说 是 2 * 2 x 64 * 64 的矩阵，计算是不连续的
+        int aidx0 = (tx / (BLOCK_M / THREAD_M)) * MICRO_M; // 0~15 0 16~31 4 32~47 8 48~63 12...
+        int bidx0 = (tx % (BLOCK_N / THREAD_N)) * MICRO_N; // 0:256:16 0 1:256:16 4
 
-        for (int subk = 0; subk < BLOCK_K; ++subk) {
-            float* ptrA = ashare + aidx0 + subk * BLOCK_M;
+        // 2 x 1  1 x 2
+        for (int k = 0; k < BLOCK_K; ++k) {
+            float* ptrA = ashare + aidx0 + k * BLOCK_M;
 
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < MICRO_M; ++i) {
                 panelA[i] = ptrA[i];
-                panelA[i + 4] = ptrA[i + 64];
+                panelA[i + MICRO_M] = ptrA[i + STRIDE_M];
             }
 
-            const float* ptrB = bshare + bidx0 + subk * BLOCK_N;
+            const float* ptrB = bshare + bidx0 + k * BLOCK_N;
 
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < MICRO_N; ++i) {
                 panelB[i] = ptrB[i];
-                panelB[i + 4] = ptrB[i + 64];
+                panelB[i + MICRO_N] = ptrB[i + STRIDE_N];
             }
 
             for (int i = 0; i < THREAD_M; ++i) {
@@ -451,17 +457,38 @@ __global__ void matmul_v4_nn(T* A, T* B, T* C, int M, int N, int K)
         __syncthreads();
     }
 
-    // part3: save to C
-    int write_offset = (by * 128 + (tx / 16) * 4) * N + bx * 128 + (tx % 16) * 4;
+    // 2 * 2 x 16 * 16 x 4 * 4
+    // part3: save to C  2x2 4x4 submat write back  2x2 4x4 的submat 是不连续的，需要注意
+    // 这里是16 * 16 的线程块算完的 4 * 4 实际一个block 一次算了一次 64 * 64, 最终迭代4次算出来的128 * 128
+    int write_offset = (by * BLOCK_M + (tx * THREAD_M / BLOCK_M) * MICRO_M) * N + bx * BLOCK_N + (tx %
+            (BLOCK_N / THREAD_N)) * MICRO_N;
 
-    for (int i = 0; i < 4; ++i) {
-        for (int j = 0; j < 4; ++j) {
+    // 这种方式的写回可能存在bank冲突, 并不是最优的
+    for (int i = 0; i < MICRO_M; ++i) {
+        for (int j = 0; j < MICRO_N; ++j) {
             C[write_offset + i * N + j] = sum[i][j];
-            C[write_offset + i * N + j + 64] = sum[i][j + 4];
-            C[write_offset + (i + 64) * N + j] = sum[i + 4][j];
-            C[write_offset + (i + 64) * N + j + 64] = sum[i + 4][j + 4];
+            C[write_offset + i * N + j + (BLOCK_N * MICRO_N / THREAD_N)] = sum[i][j + MICRO_N];
+            C[write_offset + (i + (BLOCK_M * MICRO_M / THREAD_M)) * N + j] = sum[i + MICRO_M][j];
+            C[write_offset + (i + (BLOCK_M * MICRO_M / THREAD_M)) * N + j + (BLOCK_N * MICRO_N / THREAD_N)] = sum[i +  MICRO_M][j + MICRO_N];
         }
     }
+}
+
+// 使用interleave的方式加载 能够合并访存以及 使用ldg.128 lds.128 的指令vector load访存
+//
+template<typename T, int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_SIZE = 8, int MICRO_SIZE = 4, const bool ENABLE_DOUBLE_BUFFER = false>
+__global__ void matmul_v4_1_nn(T* A, T* B, T* C, int M, int N, int K)
+{
+    int bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x;
+    __shared__ T __align__(BLOCK_M * BLOCK_K * sizeof(T)) ashare[BLOCK_K * BLOCK_M];
+    __shared__ T __align__(BLOCK_N * BLOCK_K * sizeof(T)) bshare[BLOCK_K * BLOCK_N];
+    // 每个线程计算的 THREAD_SIZE * THREAD_SIZE 个元素，其中 THREAD_SIZE * THREAD_SIZE 的小矩阵计算拆分为 MICRO_SIZE * MICRO_SIZE 的再小计算，
+    // 同样是为了能够使用interleav的方式读取内存, 同时使用模板的参数固定，能够将一些循环常量固定成常量，能够使用循环展开进行更多的性能优化
+    float sum[THREAD_SIZE][THREAD_SIZE] = {0};
+    // 实际上计算的是 THREAD_SIZE * 1 x 1 * THREAD_SIZE 的矩阵生成的 THREAD_SIZE * THREAD_SIZE 的矩阵
+    float panelA[THREAD_SIZE] = {zero<T>()}, panelB[THREAD_SIZE] = {zero<T>()};
+    int from_a = (by * BLOCK_M + tx / BLOCK_K * 4) * K + tx % BLOCK_K;
+    int from_b = (tx / WARP_SIZE) * N + bx * BLOCK_N + tx % WARP_SIZE;
 }
 
 

@@ -39,14 +39,15 @@
 #include <cuda_runtime.h>
 
 // includes
-#include <helper_cuda.h>  // helper functions for CUDA error checking and initialization
-#include <helper_functions.h>  // helper for shared functions common to CUDA Samples
+#include "helper_cuda.h"  // helper functions for CUDA error checking and initialization
+#include "helper_functions.h"  // helper for shared functions common to CUDA Samples
 
 #include <cuda.h>
 
 #include <cassert>
 #include <iostream>
 #include <memory>
+#include "common.h"
 
 static const char *sSDKsample = "CUDA Bandwidth Test";
 
@@ -129,7 +130,7 @@ void printHelp(void);
 int main(int argc, char **argv) {
   pArgc = &argc;
   pArgv = argv;
-
+  query_device(0);
   flush_buf = (char *)malloc(FLUSH_SIZE);
 
   // set logfile name and start logs
